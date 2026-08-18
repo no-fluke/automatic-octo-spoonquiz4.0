@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
+COPY quiz_sender.py .
 COPY db.py .
 
 # Only quiz images dir needed (sessions are in MongoDB now)
