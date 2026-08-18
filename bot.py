@@ -1,8 +1,32 @@
+"""
+bot.py  –  Quiz Scraper + JSON Quiz Sender Bot
+===============================================
+Two distinct workflows live here:
+
+A) Scrape polls from a private Telegram channel  (/scrape)
+B) Send quizzes from a JSON quiz file            (/sendjson)
+
+/sendjson  asks for:
+  1. The JSON file (user uploads it)
+  2. Which destination to send to
+
+Content routing for JSON quizzes (quiz_sender.py):
+  Case 1 – text question + text options → standard quiz poll
+  Case 2 – image question               → img with "Q{n}" caption + poll;
+                                          if explanation is also an image →
+                                          img with "Explanation for Q{n}" caption
+  Case 3 – explanation has img + text   → img with text-as-caption
+  Case 4 – options are images           → each option sent as img captioned
+                                          "Option A/B/C/D" + letter-answer poll
+"""
+
 import asyncio
 import gc
+import json
 import os
 import random
 import re
+import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -43,6 +67,9 @@ from db import (
     save_job, get_job, clear_job,
 )
 
+# Import the new quiz sender (must be in the same directory)
+import quiz_sender
+
 # ======================== ENV ============================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID    = os.getenv("TELEGRAM_API_ID")
@@ -60,11 +87,11 @@ OUTPUT_TXT  = "quiz_output.txt"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
 # ===================== RATE LIMITS =======================
-SEND_DELAY_MIN  = 4.0    # min gap between sends (seconds)
-SEND_DELAY_MAX  = 7.0    # max gap (randomised)
-BURST_EVERY     = 10     # take a longer break after every N sends
-BURST_PAUSE_MIN = 25.0   # min burst pause (seconds)
-BURST_PAUSE_MAX = 35.0   # max burst pause (seconds)
+SEND_DELAY_MIN  = 4.0
+SEND_DELAY_MAX  = 7.0
+BURST_EVERY     = 10
+BURST_PAUSE_MIN = 25.0
+BURST_PAUSE_MAX = 35.0
 
 VOTE_DELAY = 2.5
 AUTO_VOTE  = True
@@ -93,7 +120,6 @@ async def smart_delay():
 
 
 async def safe_send(coro, retries: int = 6):
-    """Retry any bot.send_* call on RetryAfter / network errors."""
     for attempt in range(retries):
         try:
             return await coro
@@ -112,13 +138,6 @@ async def safe_send(coro, retries: int = 6):
 
 async def safe_send_photo(bot, dest_chat_id, img_path,
                           caption=None, reply_to_id=None, retries=6):
-    """
-    Send a photo with retry logic.
-    Keeps the file handle open only during the actual attempt so
-    retries always send from the start of the file.
-    60s read/write timeouts on the bot mean this almost never
-    triggers a retry in the first place.
-    """
     for attempt in range(retries):
         try:
             with open(img_path, "rb") as f:
@@ -142,6 +161,12 @@ async def safe_send_photo(bot, dest_chat_id, img_path,
     raise RuntimeError(f"safe_send_photo failed after {retries} attempts")
 
 
+# ── Patch the stubs in quiz_sender so it uses the real helpers ───────────────
+quiz_sender.smart_delay      = smart_delay
+quiz_sender.safe_send        = safe_send
+quiz_sender.safe_send_photo  = safe_send_photo
+
+
 # ================== TELETHON SESSION HELPER ==============
 
 async def get_client(user_id: str) -> Optional[TelegramClient]:
@@ -160,6 +185,8 @@ async def save_session(user_id: str, client: TelegramClient):
 # ==================== CONVERSATION STATES =================
 LOGIN_PHONE, LOGIN_OTP, LOGIN_2FA = range(3)
 SCRAPE_START_LINK, SCRAPE_END_LINK, SCRAPE_DEST = range(3, 6)
+# New states for /sendjson
+SENDJSON_FILE, SENDJSON_DEST = range(6, 8)
 
 # ======================== HELPERS ========================
 
@@ -249,22 +276,11 @@ def format_quiz_text(quiz: dict, number: int) -> str:
 
 
 def _poll_has_no_question(poll_data: dict) -> bool:
-    """True when poll question is empty/placeholder — image IS the question."""
     q = (poll_data.get("question") or "").strip()
     return q == "" or q == "."
 
 
 def _image_is_paired_with_poll(prev_msg, poll_msg, poll_data: dict) -> bool:
-    """
-    Decide whether prev_msg (an image) belongs to poll_msg.
-
-    Paired when ANY of:
-      1. IDs are consecutive (gap == 1) — image posted immediately before poll
-      2. Poll has no real question text — image IS the question
-
-    Not paired when:
-      - ID gap > 1 AND poll has a real question text
-    """
     if prev_msg is None:
         return False
     id_gap      = poll_msg.id - prev_msg.id
@@ -279,16 +295,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_name = user.first_name if user and user.first_name else "there"
     await update.message.reply_text(
         f"👋 *Welcome, {first_name}!*\n\n"
-        "I'm your *Quiz Scraper Bot* — I scrape quizzes and polls from private Telegram channels "
-        "and deliver them to any chat of your choice.\n\n"
+        "I'm your *Quiz Bot* — I can scrape quizzes from private channels "
+        "or send quizzes from a JSON file.\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "🔐 *Account*\n"
         "• /login — connect your Telegram account\n"
         "• /logout — revoke your session\n"
         "• /status — check login status\n\n"
         "🚀 *Scraping*\n"
-        "• /scrape — scrape quizzes from a message range\n"
-        "• /set\\_destination — set where results are sent\n\n"
+        "• /scrape — scrape quizzes from a channel range\n"
+        "• /set\\_destination — manage send destinations\n\n"
+        "📄 *JSON Quiz Sender*\n"
+        "• /sendjson — upload a quiz JSON file and send to any destination\n\n"
         "⚙️ *Other*\n"
         "• /cancel — cancel any ongoing operation\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
@@ -310,7 +328,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await task
         except (asyncio.CancelledError, Exception):
             pass
-        await update.message.reply_text("⛔ Scrape cancelled.")
+        await update.message.reply_text("⛔ Operation cancelled.")
     else:
         await update.message.reply_text("❌ Cancelled.")
 
@@ -935,6 +953,216 @@ async def scrape_end_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SCRAPE_DEST
 
 
+# ================================================================
+# /sendjson  —  JSON Quiz File Sender
+# ================================================================
+
+async def sendjson_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point for /sendjson — ask for the JSON file."""
+    await update.message.reply_text(
+        "📄 *Send JSON Quiz*\n\n"
+        "Upload the quiz JSON file now.\n\n"
+        "Supported format: the JSON files exported by AchieveCap / Revolution Education "
+        "quiz scrapers (fields: `test.questions`, each with `question`, `options`, "
+        "`correct_answer`, `explanation`).\n\n"
+        "Or /cancel to abort.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return SENDJSON_FILE
+
+
+async def sendjson_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive the JSON file, validate it, then ask for destination."""
+    msg = update.message
+
+    # Accept a document (file upload) OR a plain-text JSON paste
+    json_data = None
+
+    if msg.document:
+        doc = msg.document
+        if not (doc.file_name or "").lower().endswith(".json") and \
+                "json" not in (doc.mime_type or ""):
+            await msg.reply_text(
+                "❌ That doesn't look like a JSON file. "
+                "Please upload a `.json` file or /cancel.",
+            )
+            return SENDJSON_FILE
+
+        # Download to a temp file and parse
+        try:
+            tg_file = await doc.get_file()
+            fd, tmp_path = tempfile.mkstemp(suffix=".json")
+            os.close(fd)
+            await tg_file.download_to_drive(tmp_path)
+            with open(tmp_path, "r", encoding="utf-8") as f:
+                json_data = json.load(f)
+            os.remove(tmp_path)
+        except Exception as e:
+            await msg.reply_text(f"❌ Failed to read file: {e}\n\nTry again or /cancel.")
+            return SENDJSON_FILE
+
+    elif msg.text and msg.text.strip().startswith("{"):
+        # Plain JSON pasted as text
+        try:
+            json_data = json.loads(msg.text.strip())
+        except Exception as e:
+            await msg.reply_text(f"❌ Invalid JSON: {e}\n\nTry again or /cancel.")
+            return SENDJSON_FILE
+
+    else:
+        await msg.reply_text(
+            "❌ Please upload a `.json` file or paste the JSON text. Or /cancel.",
+        )
+        return SENDJSON_FILE
+
+    # Validate structure
+    test_data = json_data.get("test") if isinstance(json_data, dict) else None
+    if not test_data or not isinstance(test_data.get("questions"), list):
+        await msg.reply_text(
+            "❌ JSON doesn't match the expected format.\n\n"
+            "Needs: `{\"test\": {\"questions\": [...]}}`\n\n"
+            "Try again or /cancel.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return SENDJSON_FILE
+
+    q_count   = len(test_data["questions"])
+    test_name = test_data.get("name", "Unknown test")
+
+    # Cache in user_data
+    context.user_data["sendjson_data"]  = json_data
+    context.user_data["sendjson_count"] = q_count
+    context.user_data["sendjson_name"]  = test_name
+    context.user_data["sendjson_user_id"] = str(update.effective_user.id)
+
+    # Ask for destination
+    user_id = str(update.effective_user.id)
+    dests   = await _get_destinations(user_id)
+    bot_chat  = {"label": "🤖 This chat (bot)", "chat_id": str(update.effective_user.id)}
+    full_list = [bot_chat] + list(dests)
+    context.user_data["sendjson_dest_list"] = full_list
+
+    lines = [
+        f"✅ Loaded *{escape_md(test_name)}* — *{q_count} question(s)*\n",
+        "📬 *Where should the quizzes be sent?*\n",
+    ]
+    for i, d in enumerate(full_list, 1):
+        lines.append(f"*{i}.* {d['label']}  (`{d['chat_id']}`)")
+    lines += ["", "Reply with the *number* of your choice, or /cancel to abort."]
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    return SENDJSON_DEST
+
+
+async def sendjson_dest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive destination choice and launch the send task."""
+    raw   = update.message.text.strip()
+    dests = context.user_data.get("sendjson_dest_list", [])
+
+    if not raw.isdigit() or not (1 <= int(raw) <= len(dests)):
+        await update.message.reply_text(
+            f"❌ Please reply with a number between *1* and *{len(dests)}*.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return SENDJSON_DEST
+
+    chosen    = dests[int(raw) - 1]
+    dest_id   = int(chosen["chat_id"])
+    label     = chosen["label"]
+    json_data = context.user_data.get("sendjson_data", {})
+    q_count   = context.user_data.get("sendjson_count", 0)
+    test_name = context.user_data.get("sendjson_name", "")
+    user_id   = context.user_data.get("sendjson_user_id", str(update.effective_user.id))
+
+    await update.message.reply_text(
+        f"✅ *Sending to:* {label}\n\n"
+        f"⏳ Starting — *{q_count} question(s)* from *{test_name}*\n\n"
+        "⚠️ _Safe delays active to avoid Telegram rate limits._",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    task = asyncio.create_task(
+        _run_sendjson(context.bot, user_id, json_data, dest_id)
+    )
+    scrape_tasks_by_user = context.application.bot_data.setdefault("scrape_tasks_by_user", {})
+    scrape_tasks_by_user[user_id] = task
+    task.add_done_callback(lambda t: scrape_tasks_by_user.pop(user_id, None))
+    scrape_tasks = context.application.bot_data.setdefault("scrape_tasks", set())
+    scrape_tasks.add(task)
+    task.add_done_callback(lambda t: scrape_tasks.discard(t))
+
+    return ConversationHandler.END
+
+
+async def _run_sendjson(bot, user_id: str, json_data: dict, dest_chat_id: int):
+    """Background task: send every quiz in json_data to dest_chat_id."""
+    global _send_counter
+    _send_counter = 0
+
+    test_data = json_data.get("test", {})
+    test_name = test_data.get("name", "Quiz")
+    questions = test_data.get("questions", [])
+    total     = len(questions)
+
+    print(f"\n{'─'*60}")
+    print(f"  [sendjson] Test : {test_name}")
+    print(f"  [sendjson] Qs   : {total}")
+    print(f"  [sendjson] Dest : {dest_chat_id}")
+    print(f"{'─'*60}\n")
+
+    await safe_send(bot.send_message(
+        chat_id    = dest_chat_id,
+        text       = (
+            f"📚 *{escape_md(test_name)}*\n"
+            f"Sending *{total}* question(s)…\n"
+            f"🐢 _Safe delays active between sends_"
+        ),
+        parse_mode = ParseMode.MARKDOWN,
+    ))
+
+    sent = 0
+    for i, raw_q in enumerate(questions):
+        n = i + 1
+        try:
+            await quiz_sender.send_json_quiz(bot, dest_chat_id, raw_q, n)
+            sent += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  ❌  Q{n} failed: {e}")
+            try:
+                await safe_send(bot.send_message(
+                    chat_id=dest_chat_id,
+                    text=f"⚠️ Q{n} could not be sent: {e}"
+                ))
+            except Exception:
+                pass
+        await smart_delay()
+
+    # Done — notify the user (private chat) and the destination
+    done_text = (
+        "✅ *Done\\!*\n\n"
+        f"📚 Test: `{escape_md(test_name)}`\n"
+        f"🧩 Questions sent: `{sent}` / `{total}`\n"
+        f"📤 Total sends: `{_send_counter}`\n\n"
+        f"📬 Destination: `{escape_md(str(dest_chat_id))}`"
+    )
+    try:
+        await safe_send(bot.send_message(
+            chat_id=user_id, text=done_text, parse_mode=ParseMode.MARKDOWN_V2
+        ))
+    except Exception:
+        pass
+    if str(dest_chat_id) != str(user_id):
+        try:
+            await safe_send(bot.send_message(
+                chat_id    = dest_chat_id,
+                text       = f"✅ *All {sent} question(s) delivered\\!*",
+                parse_mode = ParseMode.MARKDOWN_V2,
+            ))
+        except Exception:
+            pass
+
+
 # ==================== SCRAPING INTERNALS ==================
 
 def _is_image_message(message) -> bool:
@@ -955,10 +1183,6 @@ async def _cleanup_image(image_path: Optional[str]):
 
 
 async def _fetch_producer(client, entity, msg_ids, queue, stop_event):
-    """
-    Fetch FETCH_AHEAD IDs at a time, push onto bounded queue.
-    Blocks on queue.put() when full — keeps RAM flat regardless of range size.
-    """
     total = len(msg_ids)
     try:
         for slice_start in range(0, total, FETCH_AHEAD):
@@ -992,10 +1216,6 @@ async def _fetch_producer(client, entity, msg_ids, queue, stop_event):
 
 async def _flush_standalone_image(bot, dest_chat_id, prev_msg,
                                    sent_as_image_for_poll: set, client):
-    """
-    If prev_msg is an image never claimed by a poll, send it as standalone.
-    Called at the top of every non-poll handler and when a new image arrives.
-    """
     if (
         prev_msg is not None
         and _is_image_message(prev_msg)
@@ -1015,25 +1235,6 @@ async def _flush_standalone_image(bot, dest_chat_id, prev_msg,
 
 
 async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
-    """
-    Memory-safe rolling scrape with correct image ordering.
-
-    Image pairing rules
-    ───────────────────
-    • gap == 1  → always paired (image immediately before poll)
-    • poll has no question text → always paired (image IS the question)
-    • gap > 1 AND poll has question → NOT paired, flush image as standalone
-
-    Two consecutive images
-    ──────────────────────
-    • First image flushed as standalone before storing second.
-    • Handles: question_img → poll → explanation_img → question_img → poll
-
-    No out-of-order sends
-    ─────────────────────
-    • safe_send_photo() uses 60s timeout so photos complete on first attempt.
-    • Poll is only sent AFTER image send fully returns.
-    """
     global _send_counter
     _send_counter = 0
 
@@ -1104,7 +1305,6 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
         sent_as_image_for_poll: set = set()
         prev_msg = None
 
-        # ── Consumer loop ──────────────────────────────────────────────
         while True:
             message = await queue.get()
             if message is None:
@@ -1112,7 +1312,6 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
 
             total_fetched += 1
 
-            # ── Plain text ─────────────────────────────────────────────
             if not message.media and message.text and message.text.strip():
                 await _flush_standalone_image(
                     bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
@@ -1129,7 +1328,6 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
                 prev_msg = message
                 continue
 
-            # ── Poll / quiz ────────────────────────────────────────────
             if isinstance(message.media, MessageMediaPoll):
                 poll_caption = message.text or ""
                 poll_data    = parse_poll(message, caption=poll_caption)
@@ -1155,11 +1353,6 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
                     already_done_n += 1
                     print(f"  ✔  Already answered: \"{poll_data['question'][:52]}\"")
 
-                # ── Image pairing decision ─────────────────────────────
-                # Image is paired when:
-                #   1. consecutive IDs (gap == 1)
-                #   2. poll has no question text (image IS the question)
-                # Otherwise flush image as standalone first.
                 reply_to_id   = None
                 image_caption = ""
 
@@ -1175,7 +1368,6 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
                         print(f"      🖼️  Pairing img {prev_msg.id} → poll {message.id} ({reason})")
                         if image_path:
                             try:
-                                # Image send fully completes before poll is sent
                                 sent_photo = await safe_send_photo(
                                     bot, dest_chat_id, image_path,
                                     caption=image_caption or None
@@ -1224,7 +1416,6 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
                 prev_msg = message
                 continue
 
-            # ── Image / document ───────────────────────────────────────
             if isinstance(message.media, (MessageMediaPhoto, MessageMediaDocument)):
                 if message.id in sent_as_image_for_poll:
                     print(f"      ↩️  Msg {message.id} already sent as poll image — skipping")
@@ -1232,7 +1423,6 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
                     continue
 
                 if not _is_image_message(message):
-                    # Non-image document
                     await _flush_standalone_image(
                         bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
                     )
@@ -1251,9 +1441,6 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
                     prev_msg = message
                     continue
 
-                # It's an image — flush previous image if unclaimed,
-                # then hold this one for the next message.
-                # This handles: explanation_img → question_img sequences.
                 await _flush_standalone_image(
                     bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
                 )
@@ -1261,7 +1448,6 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
                 prev_msg = message
                 continue
 
-            # ── Anything else ──────────────────────────────────────────
             await _flush_standalone_image(
                 bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
             )
@@ -1269,7 +1455,6 @@ async def run_scrape(bot, user_id, channel_id, start_id, end_id, dest_chat_id):
 
         await producer_task
 
-        # Final flush — last message was a standalone image
         await _flush_standalone_image(
             bot, dest_chat_id, prev_msg, sent_as_image_for_poll, client
         )
@@ -1575,7 +1760,6 @@ async def recreate_quiz_poll(bot, quiz: dict, chat_id, number: int,
     explanation  = (quiz.get("explanation") or "")[:200]
     is_quiz_type = quiz.get("is_quiz", True)
 
-    # Telegram requires non-empty question
     if not question.strip() or question.strip() == ".":
         question = "❓"
 
@@ -1707,6 +1891,7 @@ def main():
         .build()
     )
 
+    # ── Login conversation ──────────────────────────────────────────────────
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("login", login_start)],
         states={
@@ -1717,6 +1902,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
+    # ── Destination management ──────────────────────────────────────────────
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("set_destination", set_destination)],
         states={
@@ -1729,6 +1915,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
+    # ── Channel scraper ─────────────────────────────────────────────────────
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("scrape", scrape_start)],
         states={
@@ -1739,6 +1926,20 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     ))
 
+    # ── JSON quiz sender ────────────────────────────────────────────────────
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("sendjson", sendjson_start)],
+        states={
+            SENDJSON_FILE: [MessageHandler(
+                (filters.TEXT & ~filters.COMMAND) | filters.Document.ALL,
+                sendjson_file,
+            )],
+            SENDJSON_DEST: [MessageHandler(filters.TEXT & ~filters.COMMAND, sendjson_dest)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
+    # ── Standalone commands ─────────────────────────────────────────────────
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("logout", logout))
     app.add_handler(CommandHandler("status", status))
